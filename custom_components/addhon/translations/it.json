@@ -925,8 +925,8 @@
       "mute": {
         "name": "Muto"
       },
-      "eco": {
-        "name": "Eco"
+      "beep": {
+        "name": "Segnale acustico"
       },
       "rapid": {
         "name": "Rapido"

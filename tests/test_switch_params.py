@@ -158,7 +158,7 @@ class AcSwitchPinTest(unittest.TestCase):
     _PINNED = {
         "sleep": "silentSleepStatus",
         "mute": "muteStatus",
-        "eco": "echoStatus",
+        "beep": "echoStatus",
         "rapid": "rapidMode",
         "health": "healthMode",
         "self_clean": "selfCleaningStatus",

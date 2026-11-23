@@ -13,6 +13,7 @@ Centralizing this here avoids divergences between climate.py and switch.py.
 from __future__ import annotations
 
 import logging
+import weakref
 
 from .hon_commands import async_send_command
 
@@ -99,6 +100,61 @@ def sanitize_wind_direction(command_params: dict) -> None:
             )
 
 
+# Settings parameters whose value read back from the cloud is NOT trusted once Home
+# Assistant has written it. `echoStatus` (the key-press beep; 0 = beep, 1 = silent):
+# the appliance applies the new value, but the cloud keeps reporting the old one
+# (gvigroux/hon issue #268, seen on AS25/AS35 units). Since the shadow is synced into
+# the `settings` command on every refresh and every send transmits the WHOLE group,
+# the stale value would go out again with the next temperature or mode change and
+# the beep would come back. For these parameters the value last written from Home
+# Assistant is pinned per appliance and wins over the shadow in every settings send.
+# Nothing is pinned until Home Assistant writes the parameter itself.
+AC_PINNED_PARAMS: frozenset[str] = frozenset({"echoStatus"})
+
+# appliance -> {param: value}. Weak keys: an appliance dropped by a reload takes its
+# pins with it (the switch restores them on the next start, see switch.py).
+_PINNED_SETTINGS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def pin_setting(appliance, name: str, value) -> None:
+    """Pin `name` = `value` for `appliance`, if `name` is a pinned parameter."""
+    if appliance is None or name not in AC_PINNED_PARAMS or value is None:
+        return
+    try:
+        _PINNED_SETTINGS.setdefault(appliance, {})[name] = str(value)
+    except TypeError:  # not weak-referenceable / hashable (e.g. a test double)
+        _LOGGER.debug("AC settings: cannot pin %s on %r", name, type(appliance))
+
+
+def pinned_setting(appliance, name: str) -> str | None:
+    """The value pinned for `name` on `appliance`, or None if nothing is pinned."""
+    if appliance is None:
+        return None
+    try:
+        return _PINNED_SETTINGS.get(appliance, {}).get(name)
+    except TypeError:  # not weak-referenceable / hashable (e.g. a test double)
+        return None
+
+
+def pinned_settings(appliance) -> dict[str, str]:
+    """Every value pinned for `appliance` (a copy), or {} if nothing is pinned."""
+    if appliance is None:
+        return {}
+    try:
+        return dict(_PINNED_SETTINGS.get(appliance, {}))
+    except TypeError:  # not weak-referenceable / hashable (e.g. a test double)
+        return {}
+
+
+def _pinned_settings(appliance) -> dict[str, str]:
+    """Pinned values the appliance's `settings` command actually declares."""
+    return {
+        k: v
+        for k, v in pinned_settings(appliance).items()
+        if settings_param(appliance, k) is not None
+    }
+
+
 async def async_send_settings(hass, client, appliance, params: dict) -> None:
     """Apply `params` to the AC's `settings` command and send it.
 
@@ -106,7 +162,14 @@ async def async_send_settings(hass, client, appliance, params: dict) -> None:
     anyway. Delegates to the generic sender (hon_commands.async_send_command),
     which handles command/parameter lookup, rollback and execution on the client's
     dedicated loop; the AC sanitization is plugged in as a pre_send hook.
+
+    Pinned parameters (AC_PINNED_PARAMS) are added to `params` so the whole-group
+    send carries Home Assistant's value and not the stale shadow one; a value the
+    caller passes explicitly still wins.
     """
+    pinned = _pinned_settings(appliance)
+    if pinned:
+        params = {**pinned, **params}
     await async_send_command(
         hass, client, appliance, "settings", params, pre_send=sanitize_wind_direction
     )

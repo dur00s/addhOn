@@ -916,7 +916,7 @@ class AcClimateReadPathTest(unittest.IsolatedAsyncioTestCase):
 class AcSwitchWritePathTest(unittest.IsolatedAsyncioTestCase):
     """switch.HonSettingsSwitch send semantics."""
 
-    _DESC = switch.HonSettingsSwitchDescription(key="eco", param="echoStatus", icon="mdi:leaf")
+    _DESC = switch.HonSettingsSwitchDescription(key="mute", param="muteStatus", icon="mdi:volume-off")
 
     def _switch(self, params: dict, attributes: dict | None = None, *, failing=False):
         cmd = (FailingCommand if failing else RecordingCommand)(params)
@@ -926,36 +926,36 @@ class AcSwitchWritePathTest(unittest.IsolatedAsyncioTestCase):
         return entity, cmd, coordinator
 
     async def test_turn_on_sends_1(self) -> None:
-        entity, cmd, coord = self._switch({"echoStatus": Param("0")})
+        entity, cmd, coord = self._switch({"muteStatus": Param("0")})
         await entity.async_turn_on()
-        self.assertEqual({"echoStatus": "1"}, cmd.sent)
+        self.assertEqual({"muteStatus": "1"}, cmd.sent)
         self.assertEqual(1, cmd.send_calls)
         self.assertEqual(1, coord.refreshes)
 
     async def test_turn_off_sends_0(self) -> None:
-        entity, cmd, _ = self._switch({"echoStatus": Param("1")})
+        entity, cmd, _ = self._switch({"muteStatus": Param("1")})
         await entity.async_turn_off()
-        self.assertEqual({"echoStatus": "0"}, cmd.sent)
+        self.assertEqual({"muteStatus": "0"}, cmd.sent)
 
     async def test_is_on_reads_param(self) -> None:
-        on, _, _ = self._switch({"echoStatus": Param("1")}, {"echoStatus": "1"})
-        off, _, _ = self._switch({"echoStatus": Param("0")}, {"echoStatus": "0"})
+        on, _, _ = self._switch({"muteStatus": Param("1")}, {"muteStatus": "1"})
+        off, _, _ = self._switch({"muteStatus": Param("0")}, {"muteStatus": "0"})
         # not mirrored into the shadow -> honest unknown (we do NOT fall back to the
         # command value, which the device never refreshes per poll and would be stale)
-        absent, _, _ = self._switch({"echoStatus": Param("0")}, {})
+        absent, _, _ = self._switch({"muteStatus": Param("0")}, {})
         self.assertIs(True, on.is_on)
         self.assertIs(False, off.is_on)
         self.assertIsNone(absent.is_on)
 
     async def test_send_failure_rolls_back(self) -> None:
-        entity, cmd, _ = self._switch({"echoStatus": Param("0")}, failing=True)
+        entity, cmd, _ = self._switch({"muteStatus": Param("0")}, failing=True)
         with self.assertRaises(HomeAssistantError):
             await entity.async_turn_on()
         self.assertEqual(1, cmd.send_calls)
-        self.assertEqual("0", cmd.parameters["echoStatus"].value)
+        self.assertEqual("0", cmd.parameters["muteStatus"].value)
 
     async def test_set_param_client_none_raises(self) -> None:
-        cmd = RecordingCommand({"echoStatus": Param("0")})
+        cmd = RecordingCommand({"muteStatus": Param("0")})
         coordinator = FakeCoordinator(_ac({"settings": cmd}))
         entity = switch.HonSettingsSwitch(coordinator, "ac-1", self._DESC, None)
         entity.hass = FakeHass()
@@ -968,13 +968,160 @@ class AcSwitchWritePathTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, cmd.send_calls)
 
     async def test_reraises_domain_error_unchanged(self) -> None:
-        cmd = DomainErrorCommand({"echoStatus": Param("0")}, key="inner_sw")
+        cmd = DomainErrorCommand({"muteStatus": Param("0")}, key="inner_sw")
         coordinator = FakeCoordinator(_ac({"settings": cmd}))
         entity = switch.HonSettingsSwitch(coordinator, "ac-1", self._DESC, FakeClient())
         entity.hass = FakeHass()
         with self.assertRaises(HomeAssistantError) as ctx:
             await entity.async_turn_on()
         self.assertEqual("inner_sw", getattr(ctx.exception, "translation_key", None))
+
+
+class _Appliance:
+    """Hashable, weak-referenceable appliance double (SimpleNamespace is neither),
+    so the per-appliance pin store in ac_command can key on it like the real
+    HonAppliance."""
+
+    def __init__(self, commands: dict) -> None:
+        self.commands = commands
+
+
+class _Restored:
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def as_dict(self) -> dict:
+        return self._data
+
+
+class AcBeepSwitchTest(unittest.IsolatedAsyncioTestCase):
+    """The `echoStatus` switch: the key-press beep (0 = beep, 1 = silent), inverted
+    so it reads ON while the unit beeps, and pinned because the cloud keeps
+    reporting the old value after a change (gvigroux/hon #268)."""
+
+    _DESC = next(d for d in switch._AC_SWITCHES if d.param == "echoStatus")
+
+    def _setup(self, shadow: str | None = "0", extra: dict | None = None):
+        settings = RecordingCommand(
+            {"echoStatus": Param("0"), "tempSel": Param("22"), **(extra or {})}
+        )
+        appliance = _Appliance({"settings": settings})
+        attributes = {} if shadow is None else {"echoStatus": shadow}
+        data = _ac({"settings": settings}, attributes)
+        data["ac-1"]["appliance"] = appliance
+        coordinator = FakeCoordinator(data)
+        beep = switch.HonSettingsSwitch(coordinator, "ac-1", self._DESC, FakeClient())
+        beep.hass = FakeHass()
+        clim = climate.HaierClimateEntity(coordinator, "ac-1", FakeClient())
+        clim.hass = FakeHass()
+        return beep, clim, settings, coordinator, appliance
+
+    def test_description(self) -> None:
+        self.assertEqual("beep", self._DESC.key)
+        self.assertTrue(self._DESC.inverted)
+        self.assertIn("echoStatus", ac_command.AC_PINNED_PARAMS)
+
+    async def test_is_on_inverted_from_shadow(self) -> None:
+        beeping, *_ = self._setup(shadow="0")
+        silent, *_ = self._setup(shadow="1")
+        unknown, *_ = self._setup(shadow=None)
+        self.assertIs(True, beeping.is_on)
+        self.assertIs(False, silent.is_on)
+        self.assertIsNone(unknown.is_on)
+
+    async def test_turn_off_sends_1_and_turn_on_sends_0(self) -> None:
+        beep, _, settings, _, _ = self._setup(shadow="0")
+        await beep.async_turn_off()
+        self.assertEqual("1", settings.sent["echoStatus"])
+        await beep.async_turn_on()
+        self.assertEqual("0", settings.sent["echoStatus"])
+
+    async def test_written_value_wins_over_stale_shadow(self) -> None:
+        # The cloud keeps reporting the old "0" after the beep was silenced.
+        beep, clim, settings, coordinator, _ = self._setup(shadow="0")
+        await beep.async_turn_off()
+        self.assertIs(False, beep.is_on)
+        # A refresh re-synced the stale shadow into the command...
+        settings.parameters["echoStatus"].value = "0"
+        # ...and the next climate change must still carry the silenced beep.
+        await clim.async_set_temperature(temperature=24)
+        self.assertEqual({"echoStatus": "1", "tempSel": "24"}, settings.sent)
+        self.assertIs(False, beep.is_on)
+
+    async def test_nothing_pinned_until_written(self) -> None:
+        _, clim, settings, _, appliance = self._setup(shadow="1")
+        settings.parameters["echoStatus"].value = "1"
+        await clim.async_set_temperature(temperature=24)
+        self.assertEqual("1", settings.sent["echoStatus"])
+        self.assertIsNone(ac_command.pinned_setting(appliance, "echoStatus"))
+
+    async def test_failed_send_pins_nothing(self) -> None:
+        beep, _, _, coordinator, appliance = self._setup(shadow="0")
+        failing = FailingCommand({"echoStatus": Param("0")})
+        appliance.commands["settings"] = failing
+        with self.assertRaises(HomeAssistantError):
+            await beep.async_turn_off()
+        self.assertIsNone(ac_command.pinned_setting(appliance, "echoStatus"))
+
+    async def test_pin_survives_restart(self) -> None:
+        beep, *_ = self._setup(shadow="0")
+        await beep.async_turn_off()
+        stored = beep.extra_restore_state_data.as_dict()
+        self.assertEqual({"pinned_value": "1"}, stored)
+
+        # Next start: a fresh appliance object and a stale shadow.
+        restarted, clim, settings, _, appliance = self._setup(shadow="0")
+        self.assertIsNone(restarted.extra_restore_state_data)
+
+        async def _last():
+            return _Restored(stored)
+
+        restarted.async_get_last_extra_data = _last
+        await restarted.async_added_to_hass()
+        self.assertEqual("1", ac_command.pinned_setting(appliance, "echoStatus"))
+        self.assertIs(False, restarted.is_on)
+        await clim.async_set_temperature(temperature=21)
+        self.assertEqual("1", settings.sent["echoStatus"])
+
+    async def test_program_send_carries_the_pin(self) -> None:
+        # Program-based AC: power/mode go through startProgram, which (like hon's
+        # start_command) must carry the pinned beep too, when the program declares it.
+        beep, clim, settings, coordinator, appliance = self._setup(shadow="0")
+        start = RecordingCommand(
+            {
+                "onOffStatus": Param("1"),
+                "program": Param(_PROGRAM_ENUM[0], values=list(_PROGRAM_ENUM)),
+                "echoStatus": Param("0"),
+            }
+        )
+        appliance.commands["startProgram"] = start
+        appliance.commands["stopProgram"] = RecordingCommand({"onOffStatus": Param("0")})
+        await beep.async_turn_off()
+        await clim.async_turn_on()
+        self.assertEqual("1", start.sent["echoStatus"])
+
+    async def test_program_without_the_param_is_untouched(self) -> None:
+        beep, clim, settings, coordinator, appliance = self._setup(shadow="0")
+        start = RecordingCommand(
+            {"onOffStatus": Param("1"), "program": Param(_PROGRAM_ENUM[0], values=list(_PROGRAM_ENUM))}
+        )
+        appliance.commands["startProgram"] = start
+        appliance.commands["stopProgram"] = RecordingCommand({"onOffStatus": Param("0")})
+        await beep.async_turn_off()
+        await clim.async_turn_on()
+        self.assertNotIn("echoStatus", start.sent)
+
+    async def test_other_settings_switches_are_not_pinned(self) -> None:
+        mute_desc = next(d for d in switch._AC_SWITCHES if d.param == "muteStatus")
+        beep, _, settings, coordinator, appliance = self._setup(
+            shadow="0", extra={"muteStatus": Param("0")}
+        )
+        mute = switch.HonSettingsSwitch(coordinator, "ac-1", mute_desc, FakeClient())
+        mute.hass = FakeHass()
+        await mute.async_turn_on()
+        self.assertEqual("1", settings.sent["muteStatus"])
+        self.assertIsNone(ac_command.pinned_setting(appliance, "muteStatus"))
+        self.assertIsNone(mute.extra_restore_state_data)
 
 
 class SettingsSwitchChannelTest(unittest.IsolatedAsyncioTestCase):

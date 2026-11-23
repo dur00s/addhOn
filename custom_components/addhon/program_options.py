@@ -41,6 +41,7 @@ from collections.abc import Mapping
 
 from homeassistant.exceptions import HomeAssistantError
 
+from .ac_command import pinned_settings
 from .base_entity import HonBaseEntity
 from .client.engine.parameter.range import HonParameterRange
 from .const import (
@@ -224,6 +225,16 @@ async def async_send_program(hass, client, appliance, program_code: str) -> None
                         program_code,
                     )
                     command = refreshed
+                # Pinned AC settings (ac_command.AC_PINNED_PARAMS, the beep) the program
+                # declares go out with Home Assistant's value, as on the settings path.
+                # Only an AC ever has pins; a program that does not declare one is untouched.
+                pins = pinned_settings(appliance)
+                if pins:
+                    cmd_params = getattr(command, "parameters", None)
+                    if isinstance(cmd_params, dict):
+                        for pname, pvalue in pins.items():
+                            if pname in cmd_params:
+                                cmd_params[pname].value = pvalue
                 await command.send()
             except Exception:
                 # Restore the pre-swap parameter state (shared helper copies __dict__

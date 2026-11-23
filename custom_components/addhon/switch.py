@@ -14,8 +14,15 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, Unauthorized
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
-from .ac_command import async_send_settings, settings_param
+from .ac_command import (
+    AC_PINNED_PARAMS,
+    async_send_settings,
+    pin_setting,
+    pinned_setting,
+    settings_param,
+)
 from .base_entity import HonAccountEntity, HonBaseEntity, coordinator_data_map
 from .air_purifier import (
     AirPurifierCapabilities,
@@ -120,6 +127,9 @@ class HonSettingsSwitchDescription:
     param: str
     icon: str | None = None
     sparse_command: str | None = None
+    # True when the parameter's "1" means the switch is OFF (e.g. `echoStatus`, where
+    # 0 = beep and 1 = silent, shown as a "Beep" switch that is ON while it beeps).
+    inverted: bool = False
 
 
 # AC switches: 0/1 parameters confirmed in the settings command of Roberto's AC.
@@ -127,7 +137,13 @@ class HonSettingsSwitchDescription:
 _AC_SWITCHES: tuple[HonSettingsSwitchDescription, ...] = (
     HonSettingsSwitchDescription(key="sleep", param="silentSleepStatus", icon="mdi:power-sleep"),
     HonSettingsSwitchDescription(key="mute", param="muteStatus", icon="mdi:volume-off"),
-    HonSettingsSwitchDescription(key="eco", param="echoStatus", icon="mdi:leaf"),
+    # `echoStatus` is the key-press BEEP, not an eco mode (it was shipped as "eco"
+    # before): 0 = the unit beeps on every command, 1 = silent. Inverted so the
+    # switch reads "Beep: on" while it beeps. Its cloud readback is unreliable, so
+    # the value written here is pinned (ac_command.AC_PINNED_PARAMS).
+    HonSettingsSwitchDescription(
+        key="beep", param="echoStatus", icon="mdi:volume-high", inverted=True
+    ),
     HonSettingsSwitchDescription(key="rapid", param="rapidMode", icon="mdi:fan-plus"),
     HonSettingsSwitchDescription(key="health", param="healthMode", icon="mdi:heart-pulse"),
     HonSettingsSwitchDescription(key="self_clean", param="selfCleaningStatus", icon="mdi:spray-bottle"),
@@ -1316,7 +1332,18 @@ class HonRefModeSwitch(HonBaseEntity, SwitchEntity):
             ) from err
 
 
-class HonSettingsSwitch(HonBaseEntity, SwitchEntity):
+class _PinnedSettingData(ExtraStoredData):
+    """The value a settings switch pinned (ac_command.AC_PINNED_PARAMS), kept for the
+    next start so the whole-group send keeps carrying it after a restart."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def as_dict(self) -> dict[str, str]:
+        return {"pinned_value": self.value}
+
+
+class HonSettingsSwitch(HonBaseEntity, SwitchEntity, RestoreEntity):
     """Boolean switch on a parameter of the `settings` command.
 
     Serves the air conditioner toggles, the wine-cooler interior light and the cooker
@@ -1325,6 +1352,10 @@ class HonSettingsSwitch(HonBaseEntity, SwitchEntity):
     CHANNEL, which `HonSettingsSwitchDescription.sparse_command` selects and
     `_set_param` branches on once -- see that class for why the hood cannot use the
     full-group sender the other two need.
+
+    A parameter in ac_command.AC_PINNED_PARAMS (the AC beep) is read from the value
+    Home Assistant last wrote, not from the shadow, once it has written one; that
+    value is restored across restarts through RestoreEntity's extra data.
     """
 
     def __init__(self, coordinator, appliance_id: str, description: HonSettingsSwitchDescription, client=None) -> None:
@@ -1346,16 +1377,44 @@ class HonSettingsSwitch(HonBaseEntity, SwitchEntity):
         # writes (sync_params_to_command skips shadow-absent keys), so falling back to the
         # command value would manufacture a confidently-stale state; honest unknown (None)
         # is correct. The real WC/AC mirror lightStatus, so this returns a value in practice.
-        raw = self._get_attr(self._desc.param)
+        # A pinned parameter reads the value Home Assistant wrote: the shadow's is stale.
+        raw = pinned_setting(self._appliance, self._desc.param)
+        if raw is None:
+            raw = self._get_attr(self._desc.param)
         if raw is None:
             return None
-        return str(raw) == "1"
+        return (str(raw) == "1") != self._desc.inverted
+
+    def _raw(self, on: bool) -> str:
+        """The parameter value that puts the switch in state `on`."""
+        return "1" if on != self._desc.inverted else "0"
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._set_param("1")
+        await self._set_param(self._raw(True))
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._set_param("0")
+        await self._set_param(self._raw(False))
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._desc.param not in AC_PINNED_PARAMS:
+            return
+        last = await self.async_get_last_extra_data()
+        stored = last.as_dict() if last is not None else None
+        value = stored.get("pinned_value") if isinstance(stored, dict) else None
+        if value in ("0", "1"):
+            pin_setting(self._appliance, self._desc.param, value)
+            _LOGGER.debug(
+                "Switch debug: restored pinned %s=%s id=%s",
+                self._desc.param, value, redact_id(self._appliance_id),
+            )
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData | None:
+        if self._desc.param not in AC_PINNED_PARAMS:
+            return None
+        value = pinned_setting(self._appliance, self._desc.param)
+        return _PinnedSettingData(value) if value is not None else None
 
     async def _set_param(self, value: str) -> None:
         appliance = self._appliance
@@ -1376,6 +1435,8 @@ class HonSettingsSwitch(HonBaseEntity, SwitchEntity):
                 # AC and wine cooler: unchanged. The whole `settings` group goes out,
                 # windDirection* sanitized on the way.
                 await async_send_settings(self.hass, client, appliance, {param: value})
+                # Only after the device accepted it (no-op for unpinned params).
+                pin_setting(appliance, param, value)
             else:
                 # Cooker hood: this parameter alone (plus whatever the live schema
                 # marks mandatory, which on that command is nothing). `action` is

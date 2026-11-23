@@ -33,7 +33,7 @@ returns: `FR`/`FRE` map to the fridge set and `HOB` to the induction-hob set.
 
 | Type | Code | Platforms | Read | Control (write) | Live-tested |
 |---|---|---|---|---|---|
-| Air conditioner | `AC` | climate, sensor, binary_sensor, switch, select | ✅ indoor/outdoor temp, humidity, PM2.5, CO₂, formaldehyde, compressor frequency, energy + filter change, CH₂O cleaning | ✅ **full**: mode (auto/cool/dry/heat/fan), target temp, fan speed, **swing**, + 16 switches (sleep, mute, eco, rapid, health, self-clean/56 °C, display, light, 10 °C heating, child lock, presence sensing, electric heating, fresh air, half-degree, energy saving) | ✅ yes |
+| Air conditioner | `AC` | climate, sensor, binary_sensor, switch, select | ✅ indoor/outdoor temp, humidity, PM2.5, CO₂, formaldehyde, compressor frequency, energy + filter change, CH₂O cleaning | ✅ **full**: mode (auto/cool/dry/heat/fan), target temp, fan speed, **swing**, + 16 switches (sleep, mute, beep, rapid, health, self-clean/56 °C, display, light, 10 °C heating, child lock, presence sensing, electric heating, fresh air, half-degree, energy saving) | ✅ yes |
 | Washing machine | `WM` | sensor, binary_sensor, switch, select, button | ✅ state, cycle phase, program, spin speed, wash temperature, soil level, load %, delay, errors, water/energy consumption + door/door-lock/child-lock/maintenance | ◑ pause + program select/start | ✅ yes |
 | Washer-dryer | `WD` | sensor, binary_sensor, switch, select, button | ✅ same as WM + dry level | ◑ pause + program select/start | ⚠️ no (no WD among test devices) |
 | Tumble dryer | `TD` | sensor, binary_sensor, switch, select, button | ✅ state, cycle phase, program, dry level, load %, delay, errors, total cycles + door/child-lock | ◑ pause + program select/start | ✅ yes |
